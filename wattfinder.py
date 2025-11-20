@@ -32,7 +32,7 @@ APPLIANCES = {
 COST_PER_KWH = 7.5
 
 # Gemini API configuration
-GEMINI_API_KEY = "AIzaSyBnXs8JFlV2YikEsfXezE7vEOTCISgZbLk"
+GEMINI_API_KEY = " "
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
 
 # Initialize SQLite database
