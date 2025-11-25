@@ -5,789 +5,554 @@ from ttkbootstrap.constants import *
 import random
 import time
 import sqlite3
-import paho.mqtt.client as mqtt
-import json
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import requests
 import logging
-import csv
-import os
+import warnings
+import json
 
-# Setup logging for debugging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- Universal Import Fix ---
+warnings.simplefilter("ignore") 
 
-# Simulated appliances with realistic power ranges (in watts)
-APPLIANCES = {
-    "Fridge": {"power_range": (100, 200), "surge_prob": 0.05, "surge_factor": 2.5, "daily_goal_kwh": 2.0},
-    "Air Conditioner": {"power_range": (800, 1500), "surge_prob": 0.02, "surge_factor": 1.8, "daily_goal_kwh": 10.0},
-    "Washing Machine": {"power_range": (500, 1000), "surge_prob": 0.03, "surge_factor": 2.0, "daily_goal_kwh": 5.0},
-    "Television": {"power_range": (50, 150), "surge_prob": 0.01, "surge_factor": 1.5, "daily_goal_kwh": 1.5},
-    "Microwave": {"power_range": (600, 1200), "surge_prob": 0.04, "surge_factor": 1.7, "daily_goal_kwh": 3.0}
+try:
+    from ttkbootstrap.widgets.scrolled import ScrolledFrame
+except ImportError:
+    try:
+        from ttkbootstrap.scrolled import ScrolledFrame
+    except ImportError:
+        logging.error("CRITICAL: Could not import ScrolledFrame. Update ttkbootstrap: pip install --upgrade ttkbootstrap")
+
+# --- Configuration & Constants ---
+LOG_FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+
+# API Configuration
+GEMINI_API_KEY = " "
+COST_PER_KWH = 7.50  # INR
+
+APPLIANCES_CONFIG = {
+    "Fridge": {"range": (100, 200), "surge": 2.5, "prob": 0.05, "goal": 2.0, "icon": "🧊"},
+    "AC Unit": {"range": (800, 1500), "surge": 1.8, "prob": 0.02, "goal": 10.0, "icon": "❄️"},
+    "Washing Machine": {"range": (500, 1000), "surge": 2.0, "prob": 0.03, "goal": 2.5, "icon": "🧺"},
+    "Smart TV": {"range": (50, 150), "surge": 1.5, "prob": 0.01, "goal": 1.5, "icon": "📺"},
+    "Microwave": {"range": (800, 1200), "surge": 1.2, "prob": 0.04, "goal": 1.0, "icon": "🍕"}
 }
 
-# Cost per kWh in INR
-COST_PER_KWH = 7.5
+# --- Backend Logic (Data & AI) ---
 
-# Gemini API configuration
-GEMINI_API_KEY = " "
-GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
+class AIAssistant:
+    def __init__(self):
+        self.context = (
+            "You are WattFinder AI, an enterprise energy efficiency expert. "
+            "Analyze power data and provide actionable, professional advice. "
+            "Keep responses concise (under 80 words). Currency is INR (₹). "
+            "Focus on cost savings, efficiency improvements, and surge alerts."
+        )
+        # List of models to try in order of preference (Failover System)
+        self.model_fallbacks = ["gemini-1.5-flash", "gemini-1.5-flash-001", "gemini-pro"]
 
-# Initialize SQLite database
-def init_db():
-    try:
-        conn = sqlite3.connect("wattfinder_data.db")
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS consumption (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                appliance TEXT,
-                timestamp TEXT,
-                power_w REAL,
-                kwh REAL,
-                cost_inr REAL,
-                anomaly TEXT
-            )
-        ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS historical_consumption (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                appliance TEXT,
-                timestamp TEXT,
-                power_w REAL,
-                kwh REAL,
-                cost_inr REAL,
-                anomaly TEXT
-            )
-        ''')
-        cursor.execute("SELECT COUNT(*) FROM consumption")
-        count = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM historical_consumption")
-        hist_count = cursor.fetchone()[0]
-        conn.commit()
-        conn.close()
-        if count == 0:
-            logging.info("Database empty, generating fake data")
-            generate_fake_data()
-        if hist_count == 0:
-            logging.info("Historical database empty, generating fake historical data")
-            generate_historical_data()
-    except sqlite3.Error as e:
-        logging.error(f"Database initialization error: {e}")
-
-# Generate 24-hour fake data for current day
-def generate_fake_data():
-    try:
-        conn = sqlite3.connect("wattfinder_data.db")
-        cursor = conn.cursor()
-        start_time = datetime(2025, 7, 10, 0, 0)
-        end_time = start_time + timedelta(days=1)
-        current_time = start_time
-        while current_time < end_time:
-            hour = current_time.hour
-            timestamp = current_time.strftime("%Y-%m-%d %H:%M:%S")
-            for appliance in APPLIANCES:
-                power, anomaly = simulate_power_reading(appliance, hour)
-                kwh, cost = calculate_metrics(power)
-                anomaly_text = "Surge Detected" if anomaly else "Normal"
-                cursor.execute('''
-                    INSERT INTO consumption (appliance, timestamp, power_w, kwh, cost_inr, anomaly)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (appliance, timestamp, power, kwh, cost, anomaly_text))
-            current_time += timedelta(minutes=1)
-        conn.commit()
-        logging.info("Fake data generation complete")
-    except sqlite3.Error as e:
-        logging.error(f"Data generation error: {e}")
-    finally:
-        conn.close()
-
-# Generate 30-day historical data (June 10–July 9, 2025)
-def generate_historical_data():
-    try:
-        conn = sqlite3.connect("wattfinder_data.db")
-        cursor = conn.cursor()
-        start_date = datetime(2025, 6, 10, 0, 0)
-        end_date = datetime(2025, 7, 9, 23, 59)
-        current_time = start_date
-        while current_time <= end_date:
-            hour = current_time.hour
-            timestamp = current_time.strftime("%Y-%m-%d %H:%M:%S")
-            for appliance in APPLIANCES:
-                power, anomaly = simulate_power_reading(appliance, hour)
-                power *= random.uniform(1.1, 1.2)  # 10–20% higher usage
-                kwh, cost = calculate_metrics(power)
-                anomaly_text = "Surge Detected" if anomaly else "Normal"
-                cursor.execute('''
-                    INSERT INTO historical_consumption (appliance, timestamp, power_w, kwh, cost_inr, anomaly)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (appliance, timestamp, power, kwh, cost, anomaly_text))
-            current_time += timedelta(minutes=1)
-        conn.commit()
-        logging.info("Historical data generation complete")
-    except sqlite3.Error as e:
-        logging.error(f"Historical data generation error: {e}")
-    finally:
-        conn.close()
-
-# Simulate power reading with time-based patterns
-def simulate_power_reading(appliance, hour=None):
-    power_range = APPLIANCES[appliance]["power_range"]
-    surge_prob = APPLIANCES[appliance]["surge_prob"]
-    surge_factor = APPLIANCES[appliance]["surge_factor"]
-    if hour is None:
-        hour = datetime.now().hour
-    if appliance == "Fridge":
-        power = random.uniform(power_range[0], power_range[1]) * (1.1 if 22 <= hour or hour < 6 else 1.0)
-    elif appliance == "Air Conditioner":
-        power = random.uniform(power_range[0], power_range[1]) * (1.3 if 18 <= hour or hour < 6 else 0.7)
-    elif appliance == "Washing Machine":
-        power = random.uniform(power_range[0], power_range[1]) if (8 <= hour < 12 or 18 <= hour < 20) else 0
-    elif appliance == "Television":
-        power = random.uniform(power_range[0], power_range[1]) if (18 <= hour < 23 or 12 <= hour < 16) else 0
-    elif appliance == "Microwave":
-        power = random.uniform(power_range[0], power_range[1]) if (7 <= hour < 9 or 12 <= hour < 14 or 19 <= hour < 21) else 0
-    if random.random() < surge_prob and power > 0:
-        power *= surge_factor
-        return power, True
-    return power, False
-
-# Calculate kWh and cost
-def calculate_metrics(power, duration_hours=1/60):
-    kwh = power * duration_hours / 1000
-    cost = kwh * COST_PER_KWH
-    return kwh, cost
-
-# Log data to SQLite
-def log_to_db(appliance, power, kwh, cost, anomaly):
-    try:
-        conn = sqlite3.connect("wattfinder_data.db")
-        cursor = conn.cursor()
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        anomaly_text = "Surge Detected" if anomaly else "Normal"
-        cursor.execute('''
-            INSERT INTO consumption (appliance, timestamp, power_w, kwh, cost_inr, anomaly)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (appliance, timestamp, power, kwh, cost, anomaly_text))
-        conn.commit()
-    except sqlite3.Error as e:
-        logging.error(f"Database logging error: {e}")
-    finally:
-        conn.close()
-
-# Publish data to MQTT with connection check and retry
-def publish_to_mqtt(appliance, power, kwh, cost, anomaly):
-    data = {
-        "appliance": appliance,
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "power_w": float(power),
-        "kwh": float(kwh),
-        "cost_inr": float(cost),
-        "anomaly": "Surge Detected" if anomaly else "Normal"
-    }
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            if not client.is_connected():
-                logging.warning("MQTT client disconnected, attempting to reconnect")
-                client.reconnect()
-                time.sleep(1)
-            client.publish("wattfinder/data", json.dumps(data), qos=1)
-            logging.info(f"Published data for {appliance}")
-            return
-        except Exception as e:
-            logging.error(f"MQTT publish attempt {attempt + 1} failed: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            else:
-                logging.error(f"Failed to publish data for {appliance} after {max_retries} attempts")
-
-# Export data to CSV
-def export_data_to_csv(period="daily"):
-    try:
-        conn = sqlite3.connect("wattfinder_data.db")
-        cursor = conn.cursor()
-        if period == "daily":
-            today = datetime.now().strftime("%Y-%m-%d")
-            cursor.execute('''
-                SELECT appliance, timestamp, power_w, kwh, cost_inr, anomaly
-                FROM consumption WHERE timestamp LIKE ?
-            ''', (f"{today}%",))
-            filename = f"wattfinder_export_{today}.csv"
-        else:
-            cursor.execute('''
-                SELECT appliance, timestamp, power_w, kwh, cost_inr, anomaly
-                FROM historical_consumption
-            ''')
-            filename = f"wattfinder_export_historical_{datetime.now().strftime('%Y-%m-%d')}.csv"
-        rows = cursor.fetchall()
-        conn.close()
-        with open(filename, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Appliance", "Timestamp", "Power (W)", "kWh", "Cost (INR)", "Anomaly"])
-            writer.writerows(rows)
-        return filename
-    except Exception as e:
-        logging.error(f"Export data error: {e}")
-        return None
-
-# Get anomaly history
-def get_anomaly_history():
-    try:
-        conn = sqlite3.connect("wattfinder_data.db")
-        cursor = conn.cursor()
-        today = datetime.now().strftime("%Y-%m-%d")
-        cursor.execute('''
-            SELECT appliance, timestamp, power_w
-            FROM consumption
-            WHERE anomaly = 'Surge Detected' AND timestamp LIKE ?
-            ORDER BY timestamp DESC
-        ''', (f"{today}%",))
-        rows = cursor.fetchall()
-        conn.close()
-        return rows
-    except sqlite3.Error as e:
-        logging.error(f"Anomaly history error: {e}")
-        return []
-
-# Gemini AI for chat and conservation tips
-def get_gemini_response(appliance, power, kwh, anomaly_count, user_query=None):
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            prompt = f"Electricity usage for {appliance}: Current power: {power:.2f}W, daily energy: {kwh:.2f} kWh, anomalies today: {anomaly_count}."
-            if user_query:
-                prompt += f" User asked: {user_query}. Provide a concise, accurate response related to the WattFinder application (max 50 words)."
-            else:
-                prompt += " Suggest an energy-saving tip or compare with last month's average (max 50 words)."
-            headers = {"Content-Type": "application/json"}
-            data = {
-                "contents": [{"parts": [{"text": prompt}]}]
+    def ask(self, prompt):
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "contents": [{
+                "parts": [{"text": f"{self.context}\n\n{prompt}"}]
+            }],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 200
             }
-            response = requests.post(f"{GEMINI_API_URL}?key={GEMINI_API_KEY}", headers=headers, json=data, timeout=20)
-            response.raise_for_status()
-            result = response.json()
-            text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "No response")
-            if text == "No response":
-                raise Exception("Empty response from API")
-            logging.info(f"Gemini API success for {appliance}: {text}")
-            return text
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response else "N/A"
-            logging.error(f"Gemini API attempt {attempt + 1} failed: HTTP {status}, Response: {e.response.text if e.response else 'N/A'}")
-            if status == 429:
-                logging.warning("Rate limit hit, retrying after delay")
-                time.sleep(2 ** attempt)
-            elif attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            else:
-                logging.error(f"Gemini API failed after {max_retries} attempts")
-                return {
-                    "Fridge": "Lower Fridge temperature to 3°C to save 10% energy.",
-                    "Air Conditioner": "Set Air Conditioner to 24°C to reduce energy by 15%.",
-                    "Washing Machine": "Use Washing Machine during off-peak hours to save energy.",
-                    "Television": "Turn off Television when not in use to save energy.",
-                    "Microwave": "Avoid preheating Microwave to save 5% energy."
-                }[appliance]
-        except Exception as e:
-            logging.error(f"Gemini API attempt {attempt + 1} failed: {e}, Status: N/A, Response: N/A")
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-            else:
-                logging.error(f"Gemini API failed after {max_retries} attempts")
-                return {
-                    "Fridge": "Lower Fridge temperature to 3°C to save 10% energy.",
-                    "Air Conditioner": "Set Air Conditioner to 24°C to reduce energy by 15%.",
-                    "Washing Machine": "Use Washing Machine during off-peak hours to save energy.",
-                    "Television": "Turn off Television when not in use to save energy.",
-                    "Microwave": "Avoid preheating Microwave to save 5% energy."
-                }[appliance]
-    return "AI unavailable; please check your internet connection."
-
-# Parse user query for application-specific responses
-def parse_user_query(query, stats):
-    query = query.lower()
-    for appliance in APPLIANCES:
-        if appliance.lower() in query:
-            if "usage" in query or "energy" in query:
-                return f"{appliance} used {stats[appliance]['current_kwh']:.2f} kWh today, {'down' if stats[appliance]['hist_kwh'] > stats[appliance]['current_kwh'] else 'up'} {abs((stats[appliance]['hist_kwh'] - stats[appliance]['current_kwh']) / stats[appliance]['hist_kwh'] * 100):.1f}% from last month's {stats[appliance]['hist_kwh']:.2f} kWh."
-            elif "surge" in query or "anomaly" in query:
-                return f"{appliance} had {stats[appliance]['current_anomalies']} surges today. Check for overuse or faults."
-            elif "save" in query or "tip" in query:
-                return get_gemini_response(appliance, stats[appliance]["power"], stats[appliance]["current_kwh"], stats[appliance]["current_anomalies"])
-            elif "power" in query:
-                return f"{appliance} current power: {stats[appliance]['power']:.2f} W."
-            elif "cost" in query:
-                return f"{appliance} cost today: ₹{stats[appliance]['current_kwh'] * COST_PER_KWH:.2f}."
-    if "last question" in query:
-        if recent_queries:
-            return f"Last question: {recent_queries[-1]}"
-    return None
-
-# Get daily and historical stats
-def get_stats():
-    stats = {}
-    try:
-        conn = sqlite3.connect("wattfinder_data.db")
-        cursor = conn.cursor()
-        today = datetime.now().strftime("%Y-%m-%d")
-        for appliance in APPLIANCES:
-            cursor.execute('''
-                SELECT SUM(kwh), COUNT(*) FROM consumption
-                WHERE appliance = ? AND timestamp LIKE ? AND anomaly = 'Surge Detected'
-            ''', (appliance, f"{today}%"))
-            current_kwh, current_anomalies = cursor.fetchone()
-            cursor.execute('''
-                SELECT power_w FROM consumption
-                WHERE appliance = ? ORDER BY timestamp DESC LIMIT 1
-            ''', (appliance,))
-            power = cursor.fetchone()[0] if cursor.rowcount > 0 else 0
-            cursor.execute('''
-                SELECT AVG(kwh), COUNT(*) / 30.0 FROM historical_consumption
-                WHERE appliance = ? AND anomaly = 'Surge Detected'
-            ''', (appliance,))
-            hist_kwh, hist_anomalies = cursor.fetchone()
-            stats[appliance] = {
-                "power": power or 0,
-                "current_kwh": current_kwh or 0,
-                "current_anomalies": current_anomalies or 0,
-                "hist_kwh": hist_kwh or 0,
-                "hist_anomalies": hist_anomalies or 0
-            }
-        conn.close()
-        return stats
-    except sqlite3.Error as e:
-        logging.error(f"Stats error: {e}")
-        return {appliance: {"power": 0, "current_kwh": 0, "current_anomalies": 0, "hist_kwh": 0, "hist_anomalies": 0} for appliance in APPLIANCES}
-
-# MQTT client setup
-def on_connect(client, userdata, flags, reason_code, properties=None):
-    logging.info(f"Connected to MQTT broker with code {reason_code}")
-
-client = mqtt.Client(client_id="", protocol=mqtt.MQTTv5)
-client.on_connect = on_connect
-try:
-    client.connect("broker.hivemq.com", 1883, 60)
-except Exception as e:
-    logging.error(f"MQTT initial connection error: {e}")
-
-# Professional laptop-optimized UI
-class WattFinderApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("WattFinder: Electricity Assistant")
-        self.root.geometry("1600x900")
-        self.root.configure(bg="#1E3A8A")
-        self.theme = "darkly"
-        self.recent_queries = []
-
-        # Use ttkbootstrap for modern styling
-        self.style = ttk.Style(self.theme)
-        self.style.configure("TButton", font=("Helvetica", 12, "bold"), padding=10, borderwidth=0)
-        self.style.configure("TLabel", font=("Helvetica", 12), foreground="#FFFFFF")
-        self.style.configure("TProgressbar", thickness=20)
-
-        # Main frame
-        self.main_frame = tk.Frame(self.root, bg="#2A2A3C")
-        self.main_frame.pack(fill="both", expand=True)
-
-        # Sidebar (350px wide)
-        self.sidebar = tk.Frame(self.main_frame, bg="#252537", width=350)
-        self.sidebar.pack(side="left", fill="y")
-        self.sidebar.pack_propagate(False)
-        tk.Label(self.sidebar, text="AI Assistant", font=("Helvetica", 14, "bold"), bg="#252537", fg="#FFFFFF").pack(pady=10)
-        self.chatbox = tk.Text(self.sidebar, height=20, width=35, bg="#2A2A3C", fg="#FFFFFF", font=("Helvetica", 10), wrap="word", bd=0)
-        self.chatbox.pack(padx=10, pady=5)
-        self.chatbox.config(state="disabled")
-        input_frame = tk.Frame(self.sidebar, bg="#252537")
-        input_frame.pack(fill="x", padx=10, pady=5)
-        self.chat_input = tk.Entry(input_frame, font=("Helvetica", 10), bg="#2A2A3C", fg="#FFFFFF", bd=0)
-        self.chat_input.pack(side="left", fill="x", expand=True, ipady=5)
-        self.chat_input.bind("<Return>", self.send_chat_message)
-        send_btn = ttk.Button(input_frame, text="➤", style="success.TButton", command=self.send_chat_message, width=3)
-        send_btn.pack(side="left", padx=5)
-        clear_btn = ttk.Button(self.sidebar, text="Clear Chat", style="danger.TButton", command=self.clear_chatbox)
-        clear_btn.pack(pady=5)
-        self.api_status_label = tk.Label(self.sidebar, text="AI Status: Online", font=("Helvetica", 10), bg="#252537", fg="#22C55E")
-        self.api_status_label.pack(pady=5)
-        theme_btn = ttk.Button(self.sidebar, text="Toggle Theme", style="secondary.TButton", command=self.toggle_theme)
-        theme_btn.pack(pady=5)
-
-        # Dashboard frame (~1250px wide)
-        self.dashboard = tk.Frame(self.main_frame, bg="#2A2A3C")
-        self.dashboard.pack(side="left", fill="both", expand=True)
-
-        # Header
-        header_frame = tk.Frame(self.dashboard, bg="#252537", pady=10)
-        header_frame.pack(fill="x")
-        tk.Label(header_frame, text="WattFinder Dashboard", font=("Helvetica", 16, "bold"), bg="#252537", fg="#FFFFFF").pack()
-        self.status_label = tk.Label(header_frame, text="🟢 Connected", font=("Helvetica", 10), bg="#252537", fg="#22C55E")
-        self.status_label.pack()
-
-        # Chart
-        self.fig, self.ax = plt.subplots(figsize=(7, 3))
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self.dashboard)
-        self.canvas.get_tk_widget().pack(pady=10)
-        self.plot_data = {appliance: [] for appliance in APPLIANCES}
-        self.plot_times = []
-
-        # Scrollable appliance cards
-        self.canvas_frame = tk.Canvas(self.dashboard, bg="#2A2A3C", highlightthickness=0)
-        self.scroll_frame = tk.Frame(self.canvas_frame, bg="#2A2A3C")
-        self.canvas_frame.create_window((0, 0), window=self.scroll_frame, anchor="nw")
-        self.canvas_frame.pack(side="left", fill="both", expand=True)
-        self.scroll_frame.bind("<Configure>", lambda e: self.canvas_frame.configure(scrollregion=self.canvas_frame.bbox("all")))
-        
-        # Appliance cards
-        self.cards = {}
-        for appliance in APPLIANCES:
-            self.create_appliance_card(appliance)
-
-        # Control buttons
-        button_frame = tk.Frame(self.dashboard, bg="#2A2A3C", pady=10)
-        button_frame.pack(fill="x")
-        self.start_btn = ttk.Button(button_frame, text="Start Monitoring", style="success.TButton", command=self.start_monitoring)
-        self.start_btn.pack(side="left", padx=10)
-        self.stop_btn = ttk.Button(button_frame, text="Stop Monitoring", style="danger.TButton", command=self.stop_monitoring, state="disabled")
-        self.stop_btn.pack(side="left", padx=10)
-        self.refresh_btn = ttk.Button(button_frame, text="Refresh Data", style="info.TButton", command=self.refresh_data)
-        self.refresh_btn.pack(side="left", padx=10)
-        export_btn = ttk.Button(button_frame, text="Export Data", style="info.TButton", command=self.export_data)
-        export_btn.pack(side="left", padx=10)
-        anomaly_btn = ttk.Button(button_frame, text="View Anomalies", style="warning.TButton", command=self.show_anomaly_history)
-        anomaly_btn.pack(side="left", padx=10)
-
-        # Monitoring state
-        self.running = False
-        self.recent_queries = []
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        client.loop_start()
-        threading.Thread(target=self.update_chatbox, daemon=True).start()
-
-    def create_appliance_card(self, appliance):
-        card = tk.Frame(self.scroll_frame, bg="#2A2A3C", bd=0, relief="flat", pady=10, padx=10)
-        card.pack(fill="x", padx=10, pady=5)
-        card.configure(highlightbackground="#22C55E", highlightthickness=2)
-        card.bind("<Button-1>", lambda e: self.toggle_card(appliance))
-
-        title = tk.Label(card, text=appliance, font=("Helvetica", 12, "bold"), bg="#2A2A3C", fg="#FFFFFF")
-        title.pack(anchor="w")
-        details = tk.Frame(card, bg="#2A2A3C")
-        power_label = tk.Label(details, text="Power: 0.00 W", font=("Helvetica", 10), bg="#2A2A3C", fg="#FFFFFF")
-        power_label.pack(anchor="w")
-        kwh_label = tk.Label(details, text="Energy: 0.0000 kWh", font=("Helvetica", 10), bg="#2A2A3C", fg="#FFFFFF")
-        kwh_label.pack(anchor="w")
-        cost_label = tk.Label(details, text="Cost: ₹0.00", font=("Helvetica", 10), bg="#2A2A3C", fg="#FFFFFF")
-        cost_label.pack(anchor="w")
-        status_label = tk.Label(details, text="Status: Normal", font=("Helvetica", 10), bg="#2A2A3C", fg="#22C55E")
-        status_label.pack(anchor="w")
-        ai_button = ttk.Button(details, text="AI Insight", style="info.TButton", command=lambda: self.show_ai_insight(appliance))
-        ai_button.pack(anchor="w", pady=5)
-        progress = ttk.Progressbar(details, length=350, maximum=APPLIANCES[appliance]["daily_goal_kwh"], style="success.Horizontal.TProgressbar")
-        progress.pack(pady=5)
-
-        self.cards[appliance] = {
-            "card": card,
-            "details": details,
-            "power_label": power_label,
-            "kwh_label": kwh_label,
-            "cost_label": cost_label,
-            "status_label": status_label,
-            "progress": progress,
-            "expanded": True
         }
-        details.pack()
 
-    def toggle_card(self, appliance):
-        card = self.cards[appliance]
-        if card["expanded"]:
-            card["details"].pack_forget()
-            card["expanded"] = False
-        else:
-            card["details"].pack()
-            card["expanded"] = True
+        # Try models in sequence until one works
+        for model in self.model_fallbacks:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=10)
+                
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        return data['candidates'][0]['content']['parts'][0]['text'].strip()
+                    except (KeyError, IndexError):
+                        continue # Try next model if response format is unexpected
+                elif response.status_code == 404:
+                    logging.warning(f"Model {model} not found (404). Switching to fallback...")
+                    continue # Try next model
+                else:
+                    logging.error(f"API Error {response.status_code} on {model}: {response.text[:100]}")
+                    
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Connection error on {model}: {e}")
+                continue
 
-    def toggle_theme(self):
-        try:
-            if self.theme == "darkly":
-                self.theme = "flatly"
-                self.main_frame.configure(bg="#D1D5DB")
-                self.sidebar.configure(bg="#E5E7EB")
-                self.dashboard.configure(bg="#D1D5DB")
-                self.canvas_frame.configure(bg="#D1D5DB")
-                self.scroll_frame.configure(bg="#D1D5DB")
-                for card in self.cards.values():
-                    card["card"].configure(bg="#D1D5DB", highlightbackground="#22C55E")
-                    card["details"].configure(bg="#D1D5DB")
-                    card["power_label"].configure(bg="#D1D5DB", fg="#000000")
-                    card["kwh_label"].configure(bg="#D1D5DB", fg="#000000")
-                    card["cost_label"].configure(bg="#D1D5DB", fg="#000000")
-                    card["status_label"].configure(bg="#D1D5DB", fg="#22C55E" if card["status_label"].cget("text") == "Status: Normal" else "#EF4444")
-                    self.chatbox.configure(bg="#E5E7EB", fg="#000000")
-                    self.chat_input.configure(bg="#E5E7EB", fg="#000000")
-                    self.api_status_label.configure(bg="#E5E7EB", fg="#22C55E" if self.api_status_label.cget("text") == "AI Status: Online" else "#EF4444")
-            else:
-                self.theme = "darkly"
-                self.main_frame.configure(bg="#2A2A3C")
-                self.sidebar.configure(bg="#252537")
-                self.dashboard.configure(bg="#2A2A3C")
-                self.canvas_frame.configure(bg="#2A2A3C")
-                self.scroll_frame.configure(bg="#2A2A3C")
-                for card in self.cards.values():
-                    card["card"].configure(bg="#2A2A3C", highlightbackground="#22C55E")
-                    card["details"].configure(bg="#2A2A3C")
-                    card["power_label"].configure(bg="#2A2A3C", fg="#FFFFFF")
-                    card["kwh_label"].configure(bg="#2A2A3C", fg="#FFFFFF")
-                    card["cost_label"].configure(bg="#2A2A3C", fg="#FFFFFF")
-                    card["status_label"].configure(bg="#2A2A3C", fg="#22C55E" if card["status_label"].cget("text") == "Status: Normal" else "#EF4444")
-                    self.chatbox.configure(bg="#2A2A3C", fg="#FFFFFF")
-                    self.chat_input.configure(bg="#2A2A3C", fg="#FFFFFF")
-                    self.api_status_label.configure(bg="#252537", fg="#22C55E" if self.api_status_label.cget("text") == "AI Status: Online" else "#EF4444")
-            self.style = ttk.Style(self.theme)
-            self.style.configure("TButton", font=("Helvetica", 12, "bold"), padding=10, borderwidth=0)
-            self.style.configure("TLabel", font=("Helvetica", 12), foreground="#FFFFFF" if self.theme == "darkly" else "#000000")
-            self.style.configure("TProgressbar", thickness=20)
-        except Exception as e:
-            logging.error(f"Theme toggle error: {e}")
+        return "⚠️ AI Service Unavailable. Please check internet connection."
 
-    def start_monitoring(self):
-        try:
-            self.running = True
-            self.start_btn.config(state="disabled")
-            self.stop_btn.config(state="normal")
-            self.status_label.config(text="🟢 Monitoring", fg="#22C55E")
-            threading.Thread(target=self.monitor_loop, daemon=True).start()
-        except Exception as e:
-            logging.error(f"Start monitoring error: {e}")
-            self.status_label.config(text="🔴 Error", fg="#EF4444")
+class EnergyBackend:
+    def __init__(self):
+        self.db_name = "wattfinder_enterprise.db"
+        self.init_db()
+        self.running = False
+        self.data_buffer = {k: [] for k in APPLIANCES_CONFIG.keys()}
+        self.latest_readings = {k: {'power': 0, 'kwh': 0, 'cost': 0, 'status': 'Off'} for k in APPLIANCES_CONFIG}
+        self.surge_count = {k: 0 for k in APPLIANCES_CONFIG}
+        self.session_start = None
+
+    def init_db(self):
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''CREATE TABLE IF NOT EXISTS readings 
+                              (id INTEGER PRIMARY KEY, appliance TEXT, timestamp TEXT, 
+                               power REAL, kwh REAL, cost REAL, status TEXT)''')
+            cursor.execute('''CREATE TABLE IF NOT EXISTS sessions 
+                              (id INTEGER PRIMARY KEY, start_time TEXT, end_time TEXT,
+                               total_kwh REAL, total_cost REAL, surges INTEGER)''')
+            conn.commit()
+
+    def simulate_reading(self, appliance):
+        cfg = APPLIANCES_CONFIG[appliance]
+        hour = datetime.now().hour
+        
+        # Enhanced time-of-day logic
+        is_active = True
+        if appliance == "Microwave" and not (7 <= hour <= 9 or 18 <= hour <= 21): 
+            is_active = False
+        if appliance == "Washing Machine" and not (8 <= hour <= 13): 
+            is_active = False
+        if appliance == "AC Unit" and not (10 <= hour <= 23):
+            is_active = False
+        
+        if not is_active:
+            return 0, "Standby"
+
+        base_power = random.uniform(*cfg['range'])
+        status = "Normal"
+        
+        # Surge detection
+        if random.random() < cfg['prob']:
+            base_power *= cfg['surge']
+            status = "⚠️ SURGE"
+            self.surge_count[appliance] += 1
+        
+        return base_power, status
+
+    def start_monitoring(self, update_callback):
+        self.running = True
+        self.session_start = datetime.now()
+        threading.Thread(target=self._monitor_loop, args=(update_callback,), daemon=True).start()
 
     def stop_monitoring(self):
-        try:
+        if self.running:
             self.running = False
-            self.start_btn.config(state="normal")
-            self.stop_btn.config(state="disabled")
-            self.status_label.config(text="🟢 Connected", fg="#22C55E")
-        except Exception as e:
-            logging.error(f"Stop monitoring error: {e}")
+            self._save_session()
 
-    def refresh_data(self):
-        try:
-            for appliance in APPLIANCES:
-                data = self.get_latest_data(appliance)
-                self.update_card(appliance, data)
-            self.update_chart()
-        except Exception as e:
-            logging.error(f"Refresh data error: {e}")
-            self.status_label.config(text="🔴 Error", fg="#EF4444")
-
-    def export_data(self):
-        try:
-            filename = export_data_to_csv("daily")
-            if filename:
-                messagebox.showinfo("Export Success", f"Data exported to {filename}")
-            else:
-                messagebox.showerror("Export Error", "Failed to export data")
-        except Exception as e:
-            logging.error(f"Export data error: {e}")
-            messagebox.showerror("Export Error", "Failed to export data")
-
-    def show_anomaly_history(self):
-        try:
-            rows = get_anomaly_history()
-            if not rows:
-                messagebox.showinfo("Anomaly History", "No anomalies detected today.")
-                return
-            anomaly_window = tk.Toplevel(self.root)
-            anomaly_window.title("Anomaly History")
-            anomaly_window.geometry("600x400")
-            anomaly_window.configure(bg="#2A2A3C")
-            tree = ttk.Treeview(anomaly_window, columns=("Appliance", "Timestamp", "Power"), show="headings")
-            tree.heading("Appliance", text="Appliance")
-            tree.heading("Timestamp", text="Timestamp")
-            tree.heading("Power", text="Power (W)")
-            tree.pack(fill="both", expand=True, padx=10, pady=10)
-            for row in rows:
-                tree.insert("", "end", values=(row[0], row[1], f"{row[2]:.2f}"))
-        except Exception as e:
-            logging.error(f"Anomaly history error: {e}")
-            messagebox.showerror("Anomaly History", "Failed to load anomaly history")
-
-    def monitor_loop(self):
-        while self.running:
-            try:
-                stats = get_stats()
-                for appliance in APPLIANCES:
-                    power, anomaly = simulate_power_reading(appliance)
-                    kwh, cost = calculate_metrics(power)
-                    log_to_db(appliance, power, kwh, cost, anomaly)
-                    publish_to_mqtt(appliance, power, kwh, cost, anomaly)
-                    self.update_card(appliance, {
-                        "power_w": power,
-                        "kwh": kwh,
-                        "cost_inr": cost,
-                        "anomaly": "Surge Detected" if anomaly else "Normal"
-                    })
-                    if anomaly:
-                        insight = get_gemini_response(appliance, stats[appliance]["power"], stats[appliance]["current_kwh"], stats[appliance]["current_anomalies"])
-                        self.root.after(0, lambda: messagebox.showinfo("AI Alert", insight))
-                    if stats[appliance]["current_kwh"] > APPLIANCES[appliance]["daily_goal_kwh"]:
-                        self.root.after(0, lambda: self.chatbox.config(state="normal"))
-                        self.root.after(0, lambda: self.chatbox.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] AI: {appliance} exceeded {APPLIANCES[appliance]['daily_goal_kwh']:.1f} kWh goal!\n"))
-                        self.root.after(0, lambda: self.chatbox.see(tk.END))
-                        self.root.after(0, lambda: self.chatbox.config(state="disabled"))
-                    self.plot_data[appliance].append(power)
-                    if len(self.plot_data[appliance]) > 60:
-                        self.plot_data[appliance].pop(0)
-                self.plot_times.append(datetime.now())
-                if len(self.plot_times) > 60:
-                    self.plot_times.pop(0)
-                self.root.after(0, self.update_chart)
-                time.sleep(1)
-            except Exception as e:
-                logging.error(f"Monitor loop error: {e}")
-                self.root.after(0, lambda: self.status_label.config(text="🔴 Error", fg="#EF4444"))
-
-    def update_card(self, appliance, data):
-        try:
-            card = self.cards[appliance]
-            card["power_label"].config(text=f"Power: {data['power_w']:.2f} W")
-            card["kwh_label"].config(text=f"Energy: {data['kwh']:.4f} kWh")
-            card["cost_label"].config(text=f"Cost: ₹{data['cost_inr']:.2f}")
-            card["status_label"].config(
-                text=f"Status: {data['anomaly']}",
-                fg="#EF4444" if data["anomaly"] == "Surge Detected" else "#22C55E"
-            )
-            card["progress"].config(value=data["kwh"], style="danger.Horizontal.TProgressbar" if data["kwh"] > APPLIANCES[appliance]["daily_goal_kwh"] else "success.Horizontal.TProgressbar")
-        except Exception as e:
-            logging.error(f"Update card error: {e}")
-
-    def get_latest_data(self, appliance):
-        try:
-            conn = sqlite3.connect("wattfinder_data.db")
+    def _save_session(self):
+        if not self.session_start:
+            return
+            
+        total_kwh = sum(r['kwh'] for r in self.latest_readings.values())
+        total_cost = sum(r['cost'] for r in self.latest_readings.values())
+        total_surges = sum(self.surge_count.values())
+        
+        with sqlite3.connect(self.db_name) as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                SELECT power_w, kwh, cost_inr, anomaly FROM consumption
-                WHERE appliance = ? ORDER BY timestamp DESC LIMIT 1
-            ''', (appliance,))
-            row = cursor.fetchone()
-            conn.close()
-            return {
-                "power_w": row[0] if row else 0,
-                "kwh": row[1] if row else 0,
-                "cost_inr": row[2] if row else 0,
-                "anomaly": row[3] if row else "Normal"
-            }
-        except sqlite3.Error as e:
-            logging.error(f"Get latest data error: {e}")
-            return {"power_w": 0, "kwh": 0, "cost_inr": 0, "anomaly": "Normal"}
+            cursor.execute(
+                "INSERT INTO sessions (start_time, end_time, total_kwh, total_cost, surges) VALUES (?,?,?,?,?)",
+                (self.session_start.strftime("%Y-%m-%d %H:%M:%S"),
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                 total_kwh, total_cost, total_surges)
+            )
+            conn.commit()
 
-    def send_chat_message(self, event=None):
-        try:
-            query = self.chat_input.get().strip()
-            if not query:
-                return
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self.chatbox.config(state="normal")
-            self.chatbox.insert(tk.END, f"[{timestamp}] You: {query}\n")
-            self.chat_input.delete(0, tk.END)
-            self.recent_queries.append(query)
-            if len(self.recent_queries) > 10:
-                self.recent_queries.pop(0)
-            stats = get_stats()
-            response = parse_user_query(query, stats)
-            if not response:
-                appliance = random.choice(list(APPLIANCES.keys()))
-                response = get_gemini_response(appliance, stats[appliance]["power"], stats[appliance]["current_kwh"], stats[appliance]["current_anomalies"], query)
-            self.chatbox.insert(tk.END, f"[{timestamp}] AI: {response}\n")
-            self.chatbox.see(tk.END)
-            self.chatbox.config(state="disabled")
-            self.api_status_label.config(text="AI Status: Online", fg="#22C55E")
-        except Exception as e:
-            logging.error(f"Chat message error: {e}")
-            self.chatbox.config(state="normal")
-            self.chatbox.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] AI: Error processing request; check internet.\n")
-            self.chatbox.see(tk.END)
-            self.chatbox.config(state="disabled")
-            self.api_status_label.config(text="AI Status: Offline", fg="#EF4444")
+    def _monitor_loop(self, update_callback):
+        while self.running:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            with sqlite3.connect(self.db_name) as conn:
+                cursor = conn.cursor()
+                
+                for app_name in APPLIANCES_CONFIG:
+                    power, status = self.simulate_reading(app_name)
+                    
+                    # Calculate metrics (2 second interval)
+                    kwh_inc = (power * (2/3600)) / 1000 
+                    cost_inc = kwh_inc * COST_PER_KWH
+                    
+                    # Update state
+                    prev = self.latest_readings[app_name]
+                    new_kwh = prev['kwh'] + kwh_inc
+                    new_cost = prev['cost'] + cost_inc
+                    
+                    self.latest_readings[app_name] = {
+                        'power': power,
+                        'kwh': new_kwh,
+                        'cost': new_cost,
+                        'status': status
+                    }
+                    
+                    # Buffer for graphing
+                    self.data_buffer[app_name].append(power)
+                    if len(self.data_buffer[app_name]) > 50:
+                        self.data_buffer[app_name].pop(0)
 
-    def show_ai_insight(self, appliance):
-        try:
-            stats = get_stats()
-            insight = get_gemini_response(appliance, stats[appliance]["power"], stats[appliance]["current_kwh"], stats[appliance]["current_anomalies"])
-            messagebox.showinfo(f"{appliance} AI Insight", insight)
-            self.api_status_label.config(text="AI Status: Online", fg="#22C55E")
-        except Exception as e:
-            logging.error(f"AI insight error: {e}")
-            messagebox.showinfo(f"{appliance} AI Insight", f"Error retrieving insight for {appliance}")
-            self.api_status_label.config(text="AI Status: Offline", fg="#EF4444")
-
-    def update_chatbox(self):
-        while True:
+                    # DB logging
+                    cursor.execute(
+                        "INSERT INTO readings (appliance, timestamp, power, kwh, cost, status) VALUES (?,?,?,?,?,?)",
+                        (app_name, timestamp, power, kwh_inc, cost_inc, status)
+                    )
+            
+                conn.commit()
+            
             try:
-                if self.running:
-                    stats = get_stats()
-                    for appliance in APPLIANCES:
-                        current_kwh = stats[appliance]["current_kwh"]
-                        hist_kwh = stats[appliance]["hist_kwh"]
-                        improvement = ((hist_kwh - current_kwh) / hist_kwh * 100) if hist_kwh > 0 else 0
-                        msg = f"{appliance} usage {'down' if improvement > 0 else 'up'} {abs(improvement):.1f}% from last month's {hist_kwh:.2f} kWh average."
-                        insight = get_gemini_response(appliance, stats[appliance]["power"], stats[appliance]["current_kwh"], stats[appliance]["current_anomalies"])
-                        timestamp = datetime.now().strftime("%H:%M:%S")
-                        self.chatbox.config(state="normal")
-                        self.chatbox.insert(tk.END, f"[{timestamp}] AI: {msg}\n[{timestamp}] AI: {insight}\n")
-                        self.chatbox.see(tk.END)
-                        self.chatbox.config(state="disabled")
-                        self.api_status_label.config(text="AI Status: Online", fg="#22C55E")
-                time.sleep(10)
-            except Exception as e:
-                logging.error(f"Chatbox update error: {e}")
-                self.root.after(0, lambda: self.chatbox.config(state="normal"))
-                self.root.after(0, lambda: self.chatbox.insert(tk.END, f"[{datetime.now().strftime('%H:%M:%S')}] AI: Error fetching AI tips\n"))
-                self.root.after(0, lambda: self.chatbox.see(tk.END))
-                self.root.after(0, lambda: self.chatbox.config(state="disabled"))
-                self.root.after(0, lambda: self.api_status_label.config(text="AI Status: Offline", fg="#EF4444"))
+                update_callback()
+            except RuntimeError:
+                break
+            
+            time.sleep(2)
 
-    def clear_chatbox(self):
+    def get_history_data(self):
+        return self.data_buffer
+    
+    def get_insights_summary(self):
+        """Generate data summary for AI context"""
+        readings = self.latest_readings
+        total_power = sum(r['power'] for r in readings.values())
+        total_cost = sum(r['cost'] for r in readings.values())
+        
+        # Find top consumers
+        sorted_apps = sorted(readings.items(), key=lambda x: x[1]['cost'], reverse=True)
+        top_3 = [(name, data['cost'], data['kwh']) for name, data in sorted_apps[:3]]
+        
+        # Surge analysis
+        surge_apps = [name for name, count in self.surge_count.items() if count > 0]
+        
+        summary = f"""Current System Status:
+- Total Load: {total_power:.0f}W
+- Session Cost: ₹{total_cost:.2f}
+- Top Consumers: {', '.join([f"{n} (₹{c:.2f})" for n,c,_ in top_3])}
+- Surges Detected: {', '.join(surge_apps) if surge_apps else 'None'}
+- Total Surge Events: {sum(self.surge_count.values())}"""
+        
+        return summary
+
+# --- UI Components ---
+
+class DashboardApp(ttk.Window):
+    def __init__(self):
+        super().__init__(themename="darkly")
+        self.title("WattFinder Enterprise | Energy Management System")
+        self.geometry("1450x950")
+        
         try:
-            self.chatbox.config(state="normal")
-            self.chatbox.delete(1.0, tk.END)
-            self.chatbox.config(state="disabled")
-            self.recent_queries = []
-        except Exception as e:
-            logging.error(f"Clear chatbox error: {e}")
+            self.place_window_center()
+        except AttributeError:
+            pass 
+        
+        self.backend = EnergyBackend()
+        self.ai = AIAssistant()
+        
+        self.meters = {}
+        self.stat_labels = {}
+        
+        self._setup_ui()
+        plt.style.use('dark_background')
 
-    def update_chart(self):
-        try:
-            self.ax.clear()
-            for appliance, data in self.plot_data.items():
-                if len(data) > 0:
-                    self.ax.plot(self.plot_times[-len(data):], data, label=appliance)
-            self.ax.set_ylabel("Power (W)")
-            self.ax.legend(fontsize=8)
-            self.ax.grid(True, linestyle="--", alpha=0.7)
-            plt.setp(self.ax.get_xticklabels(), rotation=45, ha="right", fontsize=8)
-            self.canvas.draw()
-        except Exception as e:
-            logging.error(f"Chart update error: {e}")
-            self.status_label.config(text="🔴 Error", fg="#EF4444")
+    def _setup_ui(self):
+        # Sidebar
+        sidebar = ttk.Frame(self, bootstyle="secondary", width=250)
+        sidebar.pack(side=LEFT, fill=Y)
+        
+        # Logo
+        ttk.Label(sidebar, text="⚡ WattFinder", font=("Helvetica", 22, "bold"), 
+                  bootstyle="inverse-secondary").pack(pady=20)
+        ttk.Label(sidebar, text="Enterprise Edition", font=("Helvetica", 9), 
+                  bootstyle="secondary").pack()
+        ttk.Separator(sidebar, bootstyle="light").pack(fill=X, padx=10, pady=10)
 
-    def on_closing(self):
-        try:
-            self.running = False
-            client.loop_stop()
-            client.disconnect()
-            self.root.destroy()
-        except Exception as e:
-            logging.error(f"Closing error: {e}")
+        # Notebook
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(side=RIGHT, fill=BOTH, expand=True)
 
-# Main execution
+        # Tabs
+        self.tab_dashboard = ttk.Frame(self.notebook, padding=20)
+        self.tab_analytics = ttk.Frame(self.notebook, padding=20)
+        
+        self.notebook.add(self.tab_dashboard, text="  📊 Live Dashboard  ")
+        self.notebook.add(self.tab_analytics, text="  🤖 AI Analytics  ")
+
+        # Sidebar Controls
+        ttk.Button(sidebar, text="▶ Start Monitoring", bootstyle="success-outline", 
+                   command=self.start_system).pack(fill=X, padx=20, pady=5)
+        ttk.Button(sidebar, text="⏸ Pause System", bootstyle="warning-outline", 
+                   command=self.stop_system).pack(fill=X, padx=20, pady=5)
+        ttk.Button(sidebar, text="💡 Quick Insights", bootstyle="info-outline", 
+                   command=self.quick_insights).pack(fill=X, padx=20, pady=5)
+        
+        ttk.Separator(sidebar, bootstyle="light").pack(fill=X, padx=10, pady=15)
+        
+        ttk.Label(sidebar, text="System Status", bootstyle="inverse-secondary", 
+                  font=("Helvetica", 10)).pack(pady=(10, 5))
+        self.status_lbl = ttk.Label(sidebar, text="⚫ OFFLINE", font=("Consolas", 12, "bold"), 
+                                     bootstyle="secondary-inverse")
+        self.status_lbl.pack()
+
+        # Build tabs
+        self._build_dashboard_tab()
+        self._build_analytics_tab()
+
+    def _build_dashboard_tab(self):
+        # KPI Cards
+        kpi_frame = ttk.Frame(self.tab_dashboard)
+        kpi_frame.pack(fill=X, pady=(0, 20))
+        
+        self.card_total_power = self._create_kpi_card(kpi_frame, "⚡ Total Load", "0 W", "warning")
+        self.card_total_cost = self._create_kpi_card(kpi_frame, "💰 Session Cost", "₹0.00", "success")
+        self.card_efficiency = self._create_kpi_card(kpi_frame, "📈 Efficiency", "100%", "info")
+        self.card_surges = self._create_kpi_card(kpi_frame, "⚠️ Surge Events", "0", "danger")
+
+        # Scrollable appliances
+        scroll_container = ScrolledFrame(self.tab_dashboard, autohide=True)
+        scroll_container.pack(fill=BOTH, expand=True)
+        
+        self.appliance_frame = scroll_container
+        
+        row, col = 0, 0
+        for app in APPLIANCES_CONFIG:
+            self._create_appliance_widget(self.appliance_frame, app, row, col)
+            col += 1
+            if col > 2:
+                col = 0
+                row += 1
+
+    def _create_kpi_card(self, parent, title, value, color):
+        frame = ttk.Frame(parent, bootstyle=f"{color}", padding=2)
+        frame.pack(side=LEFT, fill=BOTH, expand=True, padx=5)
+        
+        inner = ttk.Frame(frame, bootstyle="dark", padding=15)
+        inner.pack(fill=BOTH, expand=True)
+        
+        ttk.Label(inner, text=title, bootstyle="secondary", font=("Helvetica", 10)).pack(anchor=NW)
+        val_lbl = ttk.Label(inner, text=value, bootstyle=f"inverse-{color}", 
+                            font=("Helvetica", 20, "bold"))
+        val_lbl.pack(anchor=W, pady=(5, 0))
+        return val_lbl
+
+    def _create_appliance_widget(self, parent, name, row, col):
+        cfg = APPLIANCES_CONFIG[name]
+        frame = ttk.Labelframe(parent, text=f" {cfg['icon']} {name} ", padding=15, bootstyle="info")
+        frame.grid(row=row, column=col, sticky="nsew", padx=10, pady=10)
+        parent.columnconfigure(col, weight=1)
+
+        # Meter
+        meter = ttk.Meter(
+            master=frame,
+            metersize=180,
+            amountused=0,
+            metertype="semi",
+            subtext="Watts",
+            interactive=False,
+            bootstyle="success",
+            stripethickness=10,
+            amounttotal=cfg['range'][1] * 1.5
+        )
+        meter.pack(side=TOP, pady=5)
+        self.meters[name] = meter
+
+        # Stats
+        stats_frame = ttk.Frame(frame)
+        stats_frame.pack(fill=X, pady=8)
+        
+        lbl_kwh = ttk.Label(stats_frame, text="0.000 kWh", font=("Consolas", 10))
+        lbl_kwh.pack(side=LEFT)
+        
+        lbl_cost = ttk.Label(stats_frame, text="₹0.00", font=("Consolas", 10, "bold"), 
+                             bootstyle="warning")
+        lbl_cost.pack(side=RIGHT)
+        
+        status_lbl = ttk.Label(frame, text="● Standby", font=("Helvetica", 9), anchor=CENTER)
+        status_lbl.pack(fill=X)
+
+        self.stat_labels[name] = {
+            "kwh": lbl_kwh,
+            "cost": lbl_cost,
+            "status": status_lbl
+        }
+
+    def _build_analytics_tab(self):
+        paned = ttk.Panedwindow(self.tab_analytics, orient=HORIZONTAL)
+        paned.pack(fill=BOTH, expand=True)
+
+        # AI Chat
+        chat_frame = ttk.Labelframe(paned, text=" 🤖 AI Energy Consultant ", padding=15)
+        paned.add(chat_frame, weight=1)
+
+        self.chat_history = ttk.Text(chat_frame, height=20, width=45, font=("Segoe UI", 10), 
+                                      wrap=WORD, state=DISABLED)
+        self.chat_history.pack(fill=BOTH, expand=True, pady=(0, 10))
+        
+        # Quick action buttons
+        quick_frame = ttk.Frame(chat_frame)
+        quick_frame.pack(fill=X, pady=(0, 10))
+        ttk.Button(quick_frame, text="💡 Insights", command=self.quick_insights, 
+                   bootstyle="info-outline").pack(side=LEFT, padx=2)
+        ttk.Button(quick_frame, text="💰 Save Money", 
+                   command=lambda: self.send_to_ai_direct("How can I reduce costs?"), 
+                   bootstyle="success-outline").pack(side=LEFT, padx=2)
+        ttk.Button(quick_frame, text="⚠️ Surges", 
+                   command=lambda: self.send_to_ai_direct("Explain the surge events"), 
+                   bootstyle="warning-outline").pack(side=LEFT, padx=2)
+        
+        input_frame = ttk.Frame(chat_frame)
+        input_frame.pack(fill=X)
+        self.chat_input = ttk.Entry(input_frame, font=("Segoe UI", 10))
+        self.chat_input.pack(side=LEFT, fill=X, expand=True, padx=(0, 5))
+        self.chat_input.bind("<Return>", self.send_to_ai)
+        
+        ttk.Button(input_frame, text="Send", command=self.send_to_ai, 
+                   bootstyle="primary").pack(side=RIGHT)
+
+        # Graph
+        graph_frame = ttk.Labelframe(paned, text=" 📈 Real-time Power Graph ", padding=15)
+        paned.add(graph_frame, weight=2)
+        
+        self.fig, self.ax = plt.subplots(figsize=(6, 5), dpi=100)
+        self.fig.patch.set_facecolor('#222222')
+        self.ax.set_facecolor('#222222')
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=graph_frame)
+        self.canvas.get_tk_widget().pack(fill=BOTH, expand=True)
+
+    # --- Core Logic ---
+
+    def start_system(self):
+        if not self.backend.running:
+            self.status_lbl.configure(text="🟢 ONLINE", bootstyle="success-inverse")
+            self.backend.start_monitoring(self.schedule_ui_update)
+            self.append_chat("System", "✅ Monitoring started. Collecting real-time data...")
+
+    def stop_system(self):
+        self.backend.stop_monitoring()
+        self.status_lbl.configure(text="🟡 PAUSED", bootstyle="warning-inverse")
+        self.append_chat("System", "⏸ Monitoring paused. Session data saved.")
+
+    def schedule_ui_update(self):
+        self.after(0, self.update_ui)
+
+    def update_ui(self):
+        readings = self.backend.latest_readings
+        total_watts = 0
+        total_cost = 0
+        total_surges = sum(self.backend.surge_count.values())
+
+        for name, data in readings.items():
+            self.meters[name].configure(amountused=int(data['power']))
+            
+            if data['status'] == "⚠️ SURGE":
+                self.meters[name].configure(bootstyle="danger")
+            elif data['power'] == 0:
+                self.meters[name].configure(bootstyle="secondary")
+            else:
+                self.meters[name].configure(bootstyle="success")
+
+            self.stat_labels[name]['kwh'].configure(text=f"{data['kwh']:.3f} kWh")
+            self.stat_labels[name]['cost'].configure(text=f"₹{data['cost']:.2f}")
+            self.stat_labels[name]['status'].configure(
+                text=f"● {data['status']}", 
+                bootstyle="danger" if "SURGE" in data['status'] else "success"
+            )
+
+            total_watts += data['power']
+            total_cost += data['cost']
+
+        # Update KPIs
+        self.card_total_power.configure(text=f"{int(total_watts)} W")
+        self.card_total_cost.configure(text=f"₹{total_cost:.2f}")
+        self.card_surges.configure(text=str(total_surges))
+        
+        eff = max(0, 100 - (total_watts / 5000 * 100))
+        self.card_efficiency.configure(text=f"{eff:.1f}%")
+
+        self.update_graph()
+
+    def update_graph(self):
+        self.ax.clear()
+        history = self.backend.get_history_data()
+        
+        colors = {'Fridge': '#3498db', 'AC Unit': '#e74c3c', 'Washing Machine': '#2ecc71',
+                  'Smart TV': '#f39c12', 'Microwave': '#9b59b6'}
+        
+        for name, values in history.items():
+            if values and max(values) > 10:
+                self.ax.plot(values, label=name, color=colors.get(name, '#ffffff'), linewidth=2)
+
+        self.ax.set_title("Power Consumption Trends", color='white', fontsize=12, fontweight='bold')
+        self.ax.set_ylabel("Watts", color='white', fontsize=10)
+        self.ax.set_xlabel("Time (ticks)", color='white', fontsize=10)
+        self.ax.tick_params(colors='white', labelsize=8)
+        self.ax.grid(True, color='#444444', linestyle='--', linewidth=0.5, alpha=0.7)
+        self.ax.legend(facecolor='#333333', labelcolor='white', fontsize=9, loc='upper left', 
+                       framealpha=0.9)
+        
+        self.canvas.draw()
+
+    # --- AI Functions ---
+
+    def append_chat(self, sender, message):
+        self.chat_history.configure(state=NORMAL)
+        timestamp = datetime.now().strftime("%H:%M")
+        
+        if sender == "You":
+            tag, color = "user", "#00bc8c"
+        elif sender == "System":
+            tag, color = "system", "#f39c12"
+        else:
+            tag, color = "ai", "#3498db"
+        
+        self.chat_history.tag_config(tag, foreground=color, font=("Segoe UI", 10, "bold"))
+        self.chat_history.insert(END, f"[{timestamp}] {sender}: ", tag)
+        self.chat_history.insert(END, f"{message}\n\n")
+        self.chat_history.see(END)
+        self.chat_history.configure(state=DISABLED)
+
+    def send_to_ai(self, event=None):
+        user_text = self.chat_input.get().strip()
+        if not user_text: 
+            return
+        
+        self.append_chat("You", user_text)
+        self.chat_input.delete(0, END)
+        threading.Thread(target=self._fetch_ai_response, args=(user_text,), daemon=True).start()
+
+    def send_to_ai_direct(self, prompt):
+        """Send predefined prompt to AI"""
+        self.append_chat("You", prompt)
+        threading.Thread(target=self._fetch_ai_response, args=(prompt,), daemon=True).start()
+
+    def quick_insights(self):
+        """Quick insights button"""
+        if not self.backend.running and sum(r['cost'] for r in self.backend.latest_readings.values()) == 0:
+            self.append_chat("System", "⚠️ Start monitoring first to get insights!")
+            return
+        
+        prompt = "Provide key insights and recommendations based on current data"
+        self.send_to_ai_direct(prompt)
+
+    def _fetch_ai_response(self, user_prompt):
+        # Build comprehensive context
+        summary = self.backend.get_insights_summary()
+        
+        full_prompt = f"{summary}\n\nUser Question: {user_prompt}"
+        
+        response = self.ai.ask(full_prompt)
+        self.after(0, lambda: self.append_chat("WattFinder AI", response))
+
+    def on_close(self):
+        self.backend.stop_monitoring()
+        self.destroy()
+
 if __name__ == "__main__":
-    try:
-        init_db()
-        root = tk.Tk()
-        app = WattFinderApp(root)
-        root.mainloop()
-    except Exception as e:
-        logging.error(f"Application startup error: {e}")
+    app = DashboardApp()
+    app.protocol("WM_DELETE_WINDOW", app.on_close)
+    app.mainloop()
